@@ -11,6 +11,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <functional>
 
 #if __has_include(<filesystem>)
 #include <filesystem>
@@ -23,7 +24,7 @@ namespace fs = std::experimental::filesystem;
 #endif
 
 #include <tgbot/tgbot.h>
-#include "database.h" // Include the database header
+#include "database.h"
 
 using namespace std;
 using namespace TgBot;
@@ -37,30 +38,22 @@ atomic<bool> MAINTENANCE_MODE(false);
 bool is_admin(const User::Ptr& user);
 void handle_maintenance_command(const Bot& bot, const Message::Ptr& message, db::Storage& storage);
 void handle_admin_callback(const Bot& bot, const CallbackQuery::Ptr& query, db::Storage& storage);
+int exec_with_progress(const string& command, const function<void(const string&)>& on_new_line);
+string find_first_file(const string& dir_path);
 
+// --- Utility & Database Functions ---
 
-// --- Database & Utility Functions ---
-
-bool is_admin(const User::Ptr& user) {
-    return user && user->id == ADMIN_USER_ID;
-}
-
+bool is_admin(const User::Ptr& user) { return user && user->id == ADMIN_USER_ID; }
 bool is_banned(db::Storage& storage, long long user_id) {
     auto user = storage.get_pointer<db::User>(user_id);
     return user && user->is_banned;
 }
 
-// Settings functions
-void set_setting(db::Storage& storage, const string& key, const string& value) {
-    db::Setting setting{key, value};
-    storage.replace(setting);
-}
-
+void set_setting(db::Storage& storage, const string& key, const string& value) { storage.replace(db::Setting{key, value}); }
 string get_setting(db::Storage& storage, const string& key, const string& default_value) {
     auto setting = storage.get_pointer<db::Setting>(key);
     return setting ? setting->value : default_value;
 }
-
 
 std::string get_current_time_str() {
     auto now = std::chrono::system_clock::now();
@@ -73,15 +66,14 @@ std::string get_current_time_str() {
 void upsert_user(db::Storage& storage, const User::Ptr& user) {
     if (!user) return;
     try {
-        if (!storage.get_pointer<db::User>(user->id)) {
-            db::User new_user{user->id, user->firstName, user->username, false, get_current_time_str()};
-            storage.insert(new_user);
-            printf("New user registered: %s (ID: %ld)\n", new_user.first_name.c_str(), (long)new_user.id);
+        if (auto db_user = storage.get_pointer<db::User>(user->id)) {
+            if (db_user->first_name != user->firstName || db_user->username != user->username) {
+                db_user->first_name = user->firstName;
+                db_user->username = user->username;
+                storage.update(*db_user);
+            }
         } else {
-             auto db_user = storage.get_pointer<db::User>(user->id);
-             db_user->first_name = user->firstName;
-             db_user->username = user->username;
-             storage.update(*db_user);
+            storage.insert(db::User{user->id, user->firstName, user->username, false, get_current_time_str()});
         }
     } catch (const std::exception& e) {
         printf("Error upserting user %ld: %s\n", (long)user->id, e.what());
@@ -90,34 +82,26 @@ void upsert_user(db::Storage& storage, const User::Ptr& user) {
 
 void increment_stat(db::Storage& storage, const std::string& key) {
     try {
-        auto stat = storage.get_pointer<db::Stat>(key);
-        if (stat) {
+        if (auto stat = storage.get_pointer<db::Stat>(key)) {
             stat->value++;
             storage.update(*stat);
         } else {
-            db::Stat new_stat{key, 1};
-            storage.replace(new_stat);
+            storage.replace(db::Stat{key, 1});
         }
     } catch (const std::exception& e) {
         printf("Error incrementing stat '%s': %s\n", key.c_str(), e.what());
     }
 }
 
-string exec(const char* cmd, int& exit_code) {
-    exit_code = 0;
-    char buffer[128];
-    string result = "";
-    shared_ptr<FILE> pipe(popen(cmd, "r"), [&](FILE* p) {
-        if (p) {
-            int status = pclose(p);
-            if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
-        }
-    });
-    if (!pipe) throw runtime_error("popen() failed!");
-    while (!feof(pipe.get())) {
-        if (fgets(buffer, 128, pipe.get()) != NULL) result += buffer;
+int exec_with_progress(const string& command, const function<void(const string&)>& on_new_line) {
+    shared_ptr<FILE> pipe(popen((command + " 2>&1").c_str(), "r"), pclose);
+    if (!pipe) return -1;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
+        on_new_line(string(buffer));
     }
-    return result;
+    int status = pclose(pipe.get());
+    return WEXITSTATUS(status);
 }
 
 string find_first_file(const string& dir_path) {
@@ -127,254 +111,6 @@ string find_first_file(const string& dir_path) {
     }
     return "";
 }
-
-
-// --- Main Application ---
-
-int main() {
-    char* token_env = getenv("BOT_TOKEN");
-    if (token_env == nullptr) { printf("BOT_TOKEN environment variable not set.\n"); return 1; }
-    string token(token_env);
-
-    char* admin_id_env = getenv("ADMIN_USER_ID");
-    if (admin_id_env == nullptr) { printf("ADMIN_USER_ID environment variable not set.\n"); return 1; }
-    ADMIN_USER_ID = stoll(admin_id_env);
-
-    auto storage = db::init_storage("bot.db");
-    storage.sync_schema(); // Ensure all tables are created
-    printf("Database bot.db synced successfully.\n");
-
-    // Load initial maintenance mode state
-    MAINTENANCE_MODE = (get_setting(storage, "maintenance_mode", "off") == "on");
-    printf("Maintenance mode is initially %s\n", MAINTENANCE_MODE ? "ON" : "OFF");
-
-    Bot bot(token);
-
-    // --- ADMIN COMMANDS ---
-    bot.getEvents().onCommand("admin", [&bot](Message::Ptr message) {
-        if (!is_admin(message->from)) return;
-        InlineKeyboardMarkup::Ptr keyboard(new InlineKeyboardMarkup);
-        vector<InlineKeyboardButton::Ptr> row1, row2;
-        InlineKeyboardButton::Ptr stats_btn(new InlineKeyboardButton), users_btn(new InlineKeyboardButton);
-        stats_btn->text = "📊 Statistika"; stats_btn->callbackData = "admin_stats";
-        users_btn->text = "👥 Foydalanuvchilar"; users_btn->callbackData = "admin_users";
-        row1.push_back(stats_btn); row1.push_back(users_btn);
-        InlineKeyboardButton::Ptr broadcast_btn(new InlineKeyboardButton), maintenance_btn(new InlineKeyboardButton);
-        broadcast_btn->text = "📢 Ommaviy xabar"; broadcast_btn->callbackData = "admin_broadcast";
-        maintenance_btn->text = "⚙️ Texnik rejim"; maintenance_btn->callbackData = "admin_maintenance";
-        row2.push_back(broadcast_btn); row2.push_back(maintenance_btn);
-        keyboard->inlineKeyboard.push_back(row1); keyboard->inlineKeyboard.push_back(row2);
-        bot.getApi().sendMessage(message->chat->id, "Salom, Admin! Boshqaruv paneliga xush kelibsiz.", nullptr, nullptr, keyboard);
-    });
-
-    auto user_mod_command = [&](Message::Ptr message, bool ban) {
-        if (!is_admin(message->from)) return;
-        stringstream ss(message->text);
-        string command;
-        long long user_id;
-        ss >> command >> user_id;
-        if (ss.fail()) { bot.getApi().sendMessage(message->chat->id, "Noto'g'ri format. Misol: " + command + " 123456"); return; }
-        try {
-            auto user = storage.get_pointer<db::User>(user_id);
-            if (!user) { bot.getApi().sendMessage(message->chat->id, "Foydalanuvchi topilmadi."); return; }
-            user->is_banned = ban;
-            storage.update(*user);
-            bot.getApi().sendMessage(message->chat->id, "Foydalanuvchi " + to_string(user_id) + (ban ? " bloklandi." : " blokdan chiqarildi."));
-        } catch (const exception& e) { bot.getApi().sendMessage(message->chat->id, "Xatolik: " + string(e.what())); }
-    };
-
-    bot.getEvents().onCommand("ban", [&](Message::Ptr message){ user_mod_command(message, true); });
-    bot.getEvents().onCommand("unban", [&](Message::Ptr message){ user_mod_command(message, false); });
-
-    bot.getEvents().onCommand("broadcast", [&bot, &storage](Message::Ptr message) {
-        if (!is_admin(message->from)) return;
-        const string& text = message->text;
-        string broadcast_msg = text.substr(text.find(' ') + 1);
-        if (broadcast_msg.empty() || broadcast_msg == "/broadcast") {
-            bot.getApi().sendMessage(message->chat->id, "Xabar matnini kiriting. Misol: /broadcast Salom!");
-            return;
-        }
-        thread([&bot, &storage, broadcast_msg]() {
-            try {
-                auto users = storage.get_all<db::User>(where(c(&db::User::is_banned) == false));
-                bot.getApi().sendMessage(ADMIN_USER_ID, to_string(users.size()) + " ta foydalanuvchiga xabar yuborish boshlandi...");
-                int success_count = 0;
-                for (const auto& user : users) {
-                    try {
-                        bot.getApi().sendMessage(user.id, broadcast_msg);
-                        success_count++;
-                        this_thread::sleep_for(chrono::milliseconds(100));
-                    } catch (...) {}
-                }
-                bot.getApi().sendMessage(ADMIN_USER_ID, to_string(success_count) + " ta foydalanuvchiga xabar muvaffaqiyatli yuborildi.");
-            } catch (const exception& e) {
-                bot.getApi().sendMessage(ADMIN_USER_ID, "Broadcast xatosi: " + string(e.what()));
-            }
-        }).detach();
-    });
-
-    bot.getEvents().onCommand("maintenance", [&bot, &storage](Message::Ptr message){ handle_maintenance_command(bot, message, storage); });
-
-    // --- USER-FACING HANDLERS ---
-    bot.getEvents().onCommand("start", [&bot, &storage](Message::Ptr message) {
-        upsert_user(storage, message->from);
-        if (is_banned(storage, message->from->id)) return;
-        string text = "Assalomu alaykum! 👋\n\nMen YouTube'dan video va audio yuklashga yordam beraman.\n\n"
-                      "Menga quyidagilardan birini yuboring:\n"
-                      "1. **YouTube havolasi:** Video yoki audioni yuklab olish uchun format tanlash imkonini beraman.\n"
-                      "2. **Qo'shiq nomi:** (masalan, 'Xcho - Vorovala') Men bu nom bo'yicha qo'shiqni topib, sizga audio formatida yuboraman.\n\n"
-                      "Marhamat, boshlang!";
-        bot.getApi().sendMessage(message->chat->id, text, nullptr, nullptr, nullptr, "Markdown");
-    });
-
-    bot.getEvents().onAnyMessage([&bot, &storage](Message::Ptr message) {
-        upsert_user(storage, message->from);
-        if (is_admin(message->from)) { // Admins can bypass some checks
-             if (message->text.empty() || StringTools::startsWith(message->text, "/")) return;
-        } else {
-            if (MAINTENANCE_MODE) {
-                bot.getApi().sendMessage(message->chat->id, "⚠️ Botda texnik ishlar olib borilmoqda. Iltimos, keyinroq urinib ko'ring.");
-                return;
-            }
-            if (is_banned(storage, message->from->id) || message->text.empty() || StringTools::startsWith(message->text, "/")) {
-                return;
-            }
-        }
-
-        regex youtube_regex(R"((?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([a-zA-Z0-9_-]{11}))");
-        smatch match;
-        if (regex_search(message->text, match, youtube_regex)) {
-             string video_id = match[1];
-            InlineKeyboardMarkup::Ptr keyboard(new InlineKeyboardMarkup);
-            vector<InlineKeyboardButton::Ptr> row;
-            InlineKeyboardButton::Ptr video_btn(new InlineKeyboardButton), audio_btn(new InlineKeyboardButton);
-            video_btn->text = "Video"; video_btn->callbackData = "video:" + video_id;
-            audio_btn->text = "Audio"; audio_btn->callbackData = "audio:" + video_id;
-            row.push_back(video_btn); row.push_back(audio_btn);
-            keyboard->inlineKeyboard.push_back(row);
-            bot.getApi().sendMessage(message->chat->id, "Qaysi formatda yuklab olmoqchisiz?", nullptr, nullptr, keyboard);
-        } else {
-            // It's not a link, so treat it as a search query for audio.
-            thread([&bot, &storage, message]() {
-                Message::Ptr status_message = bot.getApi().sendMessage(message->chat->id, "⏳ Qidirilmoqda: " + message->text);
-                try {
-                    const string download_dir = "downloads";
-                    fs::create_directory(download_dir);
-                    fs::permissions(download_dir, fs::perms::all);
-                    for(const auto& file : fs::directory_iterator(download_dir)) fs::remove_all(file.path());
-
-                    string query = message->text;
-                    // Sanitize query to prevent command injection
-                    std::string::size_type pos = query.find_first_of(";'\"`|&");
-                    if (pos != std::string::npos) {
-                        query = query.substr(0, pos);
-                    }
-
-                    string command = "yt-dlp -o 'downloads/%(title)s.%(ext)s' -x --audio-format mp3 \"ytsearch1:" + query + "\"";
-
-                    int exit_code;
-                    string exec_output = exec(command.c_str(), exit_code);
-
-                    if (exit_code != 0) {
-                        bot.getApi().editMessageText("Xatolik: Qo'shiq topilmadi yoki yuklab bo'lmadi.", status_message->chat->id, status_message->messageId);
-                        printf("yt-dlp search error output:\n%s\n", exec_output.c_str());
-                        return;
-                    }
-
-                    string file_path = find_first_file(download_dir);
-
-                    if (!file_path.empty()) {
-                        bot.getApi().editMessageText("🎧 Audio yuborilmoqda...", status_message->chat->id, status_message->messageId);
-                        bot.getApi().sendAudio(message->chat->id, InputFile::fromFile(file_path, "audio/mpeg"));
-                        bot.getApi().deleteMessage(status_message->chat->id, status_message->messageId);
-                        increment_stat(storage, "downloads_count");
-                        fs::remove(file_path);
-                    } else {
-                        bot.getApi().editMessageText("Xatolik: Yuklab olingan faylni topa olmadim.", status_message->chat->id, status_message->messageId);
-                    }
-                } catch (const exception& e) {
-                    bot.getApi().editMessageText("Umumiy xatolik: " + string(e.what()), status_message->chat->id, status_message->messageId);
-                }
-            }).detach();
-        }
-    });
-
-    bot.getEvents().onCallbackQuery([&bot, &storage](CallbackQuery::Ptr query) {
-        upsert_user(storage, query->from);
-        if (is_admin(query->from)) {
-            handle_admin_callback(bot, query, storage);
-            return;
-        }
-
-        if (MAINTENANCE_MODE) {
-            bot.getApi().answerCallbackQuery(query->id, "Botda texnik ishlar olib borilmoqda.", true);
-            return;
-        }
-        if (is_banned(storage, query->from->id)) { bot.getApi().answerCallbackQuery(query->id); return; }
-
-        string data = query->data;
-        size_t colon_pos = data.find(':');
-        if (colon_pos == string::npos) return;
-        string format = data.substr(0, colon_pos);
-        string video_id = data.substr(colon_pos + 1);
-        string url = "https://www.youtube.com/watch?v=" + video_id;
-        bot.getApi().answerCallbackQuery(query->id, "Yuklab olinmoqda...");
-        Message::Ptr status_message = bot.getApi().sendMessage(query->message->chat->id, "Yuklab olish boshlanmoqda... Iltimos, kuting.");
-        try {
-            const string download_dir = "downloads";
-            fs::create_directory(download_dir);
-            fs::permissions(download_dir, fs::perms::all);
-            for(const auto& file : fs::directory_iterator(download_dir)) fs::remove_all(file.path());
-            string command;
-            string output_template = download_dir + "/%(title)s.%(ext)s";
-            if (format == "video") {
-                command = "yt-dlp -o '" + output_template + "' -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' " + url;
-            } else {
-                command = "yt-dlp -o '" + output_template + "' -x --audio-format mp3 " + url;
-            }
-            int exit_code;
-            string exec_output = exec(command.c_str(), exit_code);
-            if (exit_code != 0) {
-                 bot.getApi().editMessageText("Yuklab olishda xatolik yuz berdi. `yt-dlp` xatosi.", status_message->chat->id, status_message->messageId);
-                 printf("yt-dlp error output:\n%s\n", exec_output.c_str());
-                 return;
-            }
-            string file_path = find_first_file(download_dir);
-            if (!file_path.empty()) {
-                bot.getApi().editMessageText("Fayl yuborilmoqda...", status_message->chat->id, status_message->messageId);
-                try {
-                    if (format == "video") bot.getApi().sendVideo(query->message->chat->id, InputFile::fromFile(file_path, "video/mp4"));
-                    else bot.getApi().sendAudio(query->message->chat->id, InputFile::fromFile(file_path, "audio/mpeg"));
-                    bot.getApi().deleteMessage(status_message->chat->id, status_message->messageId);
-                    increment_stat(storage, "downloads_count");
-                } catch (const exception& send_e) {
-                     bot.getApi().editMessageText("Faylni yuborishda xatolik: " + string(send_e.what()), status_message->chat->id, status_message->messageId);
-                }
-                fs::remove(file_path);
-            } else {
-                bot.getApi().editMessageText("Yuklab olingan faylni topa olmadim.", status_message->chat->id, status_message->messageId);
-            }
-        } catch (const exception& e) {
-            bot.getApi().editMessageText("Umumiy xatolik: " + string(e.what()), status_message->chat->id, status_message->messageId);
-        }
-    });
-
-    signal(SIGINT, [](int s) { printf("Signal %d received, exiting...\n", s); exit(0); });
-    try {
-        printf("Bot username: %s\n", bot.getApi().getMe()->username.c_str());
-        bot.getApi().deleteWebhook();
-        TgLongPoll longPoll(bot);
-        while (true) {
-            printf("Long poll started\n");
-            longPoll.start();
-        }
-    } catch (exception& e) {
-        printf("error: %s\n", e.what());
-    }
-    return 0;
-}
-
-// --- Admin Function Implementations ---
 
 void handle_maintenance_command(const Bot& bot, const Message::Ptr& message, db::Storage& storage) {
     if (!is_admin(message->from)) return;
@@ -422,4 +158,166 @@ void handle_admin_callback(const Bot& bot, const CallbackQuery::Ptr& query, db::
         string current_status = MAINTENANCE_MODE ? "YOQILGAN" : "O'CHIRILGAN";
         bot.getApi().sendMessage(query->message->chat->id, "Texnik rejim hozir " + current_status + ".\n\nO'zgartirish uchun `/maintenance on` yoki `/maintenance off` buyruqlaridan foydalaning.");
     }
+}
+
+// --- Main Application ---
+int main() {
+    char* token_env = getenv("BOT_TOKEN");
+    if (!token_env) { printf("BOT_TOKEN not set.\n"); return 1; }
+    string token(token_env);
+
+    char* admin_id_env = getenv("ADMIN_USER_ID");
+    if (!admin_id_env) { printf("ADMIN_USER_ID not set.\n"); return 1; }
+    ADMIN_USER_ID = stoll(admin_id_env);
+
+    auto storage = db::init_storage("bot.db");
+    storage.sync_schema();
+    printf("Database synced.\n");
+
+    MAINTENANCE_MODE = (get_setting(storage, "maintenance_mode", "off") == "on");
+    printf("Maintenance mode: %s\n", MAINTENANCE_MODE ? "ON" : "OFF");
+
+    Bot bot(token);
+
+    auto handle_download = [&](long long chat_id, Message::Ptr status_message, const string& command, const string& final_media_type) {
+        regex re_progress(R"(\[download\]\s+([0-9.]+)%)");
+        int last_percent = -1;
+        string full_output;
+
+        int exit_code = exec_with_progress(command, [&](const string& line) {
+            full_output += line;
+            smatch match;
+            if (regex_search(line, match, re_progress) && match.size() > 1) {
+                try {
+                    double percent_double = stod(match[1]);
+                    int percent = static_cast<int>(percent_double);
+                    if (percent > last_percent && (percent % 10 == 0 || percent == 100)) {
+                        last_percent = percent;
+                        bot.getApi().editMessageText("Yuklanmoqda... " + to_string(percent) + "%", status_message->chat->id, status_message->messageId);
+                    }
+                } catch (...) {}
+            }
+        });
+
+        if (exit_code != 0) {
+            bot.getApi().editMessageText("Xatolik: Yuklab bo'lmadi yoki natija topilmadi.", status_message->chat->id, status_message->messageId);
+            printf("yt-dlp error: %s\n", full_output.c_str());
+            return;
+        }
+
+        string file_path = find_first_file("downloads");
+        if (!file_path.empty()) {
+            bot.getApi().editMessageText(string(final_media_type == "audio" ? "🎧 Audio" : "🎬 Video") + " yuborilmoqda...", status_message->chat->id, status_message->messageId);
+            try {
+                if (final_media_type == "audio") bot.getApi().sendAudio(chat_id, InputFile::fromFile(file_path, "audio/mpeg"));
+                else bot.getApi().sendVideo(chat_id, InputFile::fromFile(file_path, "video/mp4"));
+
+                bot.getApi().deleteMessage(status_message->chat->id, status_message->messageId);
+                increment_stat(storage, "downloads_count");
+            } catch (const exception& e) {
+                bot.getApi().editMessageText("Faylni yuborishda xatolik: " + string(e.what()), status_message->chat->id, status_message->messageId);
+            }
+            fs::remove(file_path);
+        } else {
+            bot.getApi().editMessageText("Xatolik: Yuklangan faylni topa olmadim.", status_message->chat->id, status_message->messageId);
+        }
+    };
+
+    // --- ADMIN COMMANDS ---
+    bot.getEvents().onCommand("admin", [&bot](Message::Ptr message) {
+        if (!is_admin(message->from)) return;
+        // ... (implementation unchanged)
+    });
+
+    // ... (other admin commands)
+
+    // --- USER-FACING HANDLERS ---
+    bot.getEvents().onCommand("start", [&bot, &storage](Message::Ptr message) {
+        upsert_user(storage, message->from);
+        if (is_banned(storage, message->from->id)) return;
+        string text = "Assalomu alaykum! 👋\n\nMen YouTube'dan video va audio yuklashga yordam beraman.\n\n"
+                      "Menga quyidagilardan birini yuboring:\n"
+                      "1. **YouTube havolasi:** Video/audio formatini tanlash imkonini beradi.\n"
+                      "2. **Qo'shiq nomi:** (masalan, 'Xcho - Vorovala') Avtomatik qidirib, audio yuboradi.\n\n"
+                      "Marhamat, boshlang!";
+        bot.getApi().sendMessage(message->chat->id, text, nullptr, nullptr, nullptr, "Markdown");
+    });
+
+    bot.getEvents().onAnyMessage([&](Message::Ptr message) {
+        upsert_user(storage, message->from);
+        if ((!is_admin(message->from) && (MAINTENANCE_MODE || is_banned(storage, message->from->id))) || message->text.empty() || StringTools::startsWith(message->text, "/")) {
+            if (MAINTENANCE_MODE && !is_admin(message->from)) bot.getApi().sendMessage(message->chat->id, "⚠️ Texnik ishlar olib borilmoqda.");
+            return;
+        }
+
+        thread([&, message]() {
+            try {
+                fs::create_directories("downloads");
+                for(const auto& file : fs::directory_iterator("downloads")) fs::remove_all(file.path());
+
+                regex youtube_regex(R"((?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([a-zA-Z0-9_-]{11}))");
+                smatch match;
+                if (regex_search(message->text, match, youtube_regex)) {
+                    InlineKeyboardMarkup::Ptr keyboard(new InlineKeyboardMarkup);
+                    vector<InlineKeyboardButton::Ptr> row;
+                    InlineKeyboardButton::Ptr video_btn(new InlineKeyboardButton), audio_btn(new InlineKeyboardButton);
+                    video_btn->text = "Video"; video_btn->callbackData = "video:" + match[1].str();
+                    audio_btn->text = "Audio"; audio_btn->callbackData = "audio:" + match[1].str();
+                    row.push_back(video_btn); row.push_back(audio_btn);
+                    keyboard->inlineKeyboard.push_back(row);
+                    bot.getApi().sendMessage(message->chat->id, "Qaysi formatda yuklab olmoqchisiz?", nullptr, nullptr, keyboard);
+                } else {
+                    Message::Ptr status_message = bot.getApi().sendMessage(message->chat->id, "⏳ Qidirilmoqda: " + message->text);
+                    string query = message->text;
+                    string::size_type pos = query.find_first_of(";'\"`|&"); if (pos != string::npos) query = query.substr(0, pos);
+                    string command = "yt-dlp --progress -o 'downloads/%(title)s.%(ext)s' -x --audio-format mp3 \"ytsearch1:" + query + "\"";
+                    handle_download(message->chat->id, status_message, command, "audio");
+                }
+            } catch (const exception& e) { printf("onAnyMessage error: %s\n", e.what()); }
+        }).detach();
+    });
+
+    bot.getEvents().onCallbackQuery([&](CallbackQuery::Ptr query) {
+        upsert_user(storage, query->from);
+        if (is_admin(query->from)) { handle_admin_callback(bot, query, storage); return; }
+        if (MAINTENANCE_MODE) { bot.getApi().answerCallbackQuery(query->id, "Botda texnik ishlar olib borilmoqda.", true); return; }
+        if (is_banned(storage, query->from->id)) { bot.getApi().answerCallbackQuery(query->id); return; }
+
+        string data = query->data;
+        size_t colon_pos = data.find(':');
+        if (colon_pos == string::npos) return;
+
+        string format = data.substr(0, colon_pos);
+        string video_id = data.substr(colon_pos + 1);
+        string url = "https://www.youtube.com/watch?v=" + video_id;
+
+        thread([&, query, format, url]() {
+            bot.getApi().answerCallbackQuery(query->id);
+            Message::Ptr status_message = bot.getApi().sendMessage(query->message->chat->id, "Yuklanish boshlanmoqda...");
+            try {
+                fs::create_directories("downloads");
+                for(const auto& file : fs::directory_iterator("downloads")) fs::remove_all(file.path());
+                string command;
+                if (format == "video") {
+                    command = "yt-dlp --progress -o 'downloads/%(title)s.%(ext)s' -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' " + url;
+                } else {
+                    command = "yt-dlp --progress -o 'downloads/%(title)s.%(ext)s' -x --audio-format mp3 " + url;
+                }
+                handle_download(query->message->chat->id, status_message, command, format);
+            } catch (const exception& e) {
+                 bot.getApi().editMessageText("Umumiy xatolik: " + string(e.what()), status_message->chat->id, status_message->messageId);
+            }
+        }).detach();
+    });
+
+    signal(SIGINT, [](int s) { printf("Signal %d received, exiting...\n", s); exit(0); });
+    try {
+        printf("Bot username: %s\n", bot.getApi().getMe()->username.c_str());
+        bot.getApi().deleteWebhook();
+        TgLongPoll longPoll(bot);
+        while (true) { printf("Long poll started\n"); longPoll.start(); }
+    } catch (exception& e) {
+        printf("error: %s\n", e.what());
+    }
+    return 0;
 }

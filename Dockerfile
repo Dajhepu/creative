@@ -57,14 +57,16 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install yt-dlp
-
 WORKDIR /app
 
-# Copy the compiled bot executable from the builder stage
+# Copy necessary files from the builder stage
 COPY --from=builder /app/build/TgYoutubeBot .
+COPY start.sh .
+
+# Make the start script executable
+RUN chmod +x ./start.sh
 
 RUN mkdir -p downloads && chmod 777 downloads
 
 # Set BOT_TOKEN and ADMIN_USER_ID in the Railway.app service configuration.
-CMD ["./TgYoutubeBot"]
+CMD ["./start.sh"]
