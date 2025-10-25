@@ -28,11 +28,10 @@ RUN git clone https://github.com/reo7sp/tgbot-cpp.git && \
 
 WORKDIR /app
 
-# Copy the bot source code, including submodules
-COPY .git .git
-COPY .gitmodules .
-RUN git submodule update --init --recursive
+# Clone sqlite_orm into the vendor directory
+RUN git clone https://github.com/fnc12/sqlite_orm.git vendor/sqlite_orm
 
+# Copy the rest of the bot source code
 COPY . .
 
 # Build the bot executable
@@ -60,8 +59,8 @@ RUN pip3 install yt-dlp
 
 WORKDIR /app
 
+# Copy the compiled bot executable from the builder stage
 COPY --from=builder /app/build/TgYoutubeBot .
-COPY --from=builder /app/build/bot.db .
 
 RUN mkdir -p downloads && chmod 777 downloads
 
