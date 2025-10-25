@@ -141,6 +141,7 @@ int main() {
     ADMIN_USER_ID = stoll(admin_id_env);
 
     auto storage = db::init_storage("bot.db");
+    storage.sync_schema(); // Ensure all tables are created
     printf("Database bot.db synced successfully.\n");
 
     // Load initial maintenance mode state
