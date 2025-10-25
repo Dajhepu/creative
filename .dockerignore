@@ -1,0 +1,22 @@
+# Git version control directory
+.git
+.github
+
+# Local build directory
+build/
+
+# Local downloads directory
+downloads/
+
+# IDE and editor specific files
+.vscode/
+*.swp
+*.swo
+
+# Docker files
+.dockerignore
+Dockerfile
+
+# Other repository files
+README.md
+.gitignore
