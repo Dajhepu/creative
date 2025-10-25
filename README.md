@@ -3,7 +3,8 @@
 Bu C++ da yozilgan Telegram bot bo'lib, YouTube'dan video va audio yuklab olish imkonini beradi. Botda to'liq funksional admin paneli mavjud.
 
 ## Asosiy Xususiyatlar
-- YouTube'dan video va audio yuklab olish.
+- YouTube havolasi orqali video va audio yuklab olish.
+- Qo'shiq nomi bo'yicha qidirish va audio (mp3) formatida yuklab olish.
 - Foydalanuvchilarni boshqarish (ban/unban).
 - Bot faoliyati statistikasi.
 - Barcha foydalanuvchilarga ommaviy xabar yuborish (broadcast).

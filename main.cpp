@@ -216,6 +216,17 @@ int main() {
     bot.getEvents().onCommand("maintenance", [&bot, &storage](Message::Ptr message){ handle_maintenance_command(bot, message, storage); });
 
     // --- USER-FACING HANDLERS ---
+    bot.getEvents().onCommand("start", [&bot, &storage](Message::Ptr message) {
+        upsert_user(storage, message->from);
+        if (is_banned(storage, message->from->id)) return;
+        string text = "Assalomu alaykum! 👋\n\nMen YouTube'dan video va audio yuklashga yordam beraman.\n\n"
+                      "Menga quyidagilardan birini yuboring:\n"
+                      "1. **YouTube havolasi:** Video yoki audioni yuklab olish uchun format tanlash imkonini beraman.\n"
+                      "2. **Qo'shiq nomi:** (masalan, 'Xcho - Vorovala') Men bu nom bo'yicha qo'shiqni topib, sizga audio formatida yuboraman.\n\n"
+                      "Marhamat, boshlang!";
+        bot.getApi().sendMessage(message->chat->id, text, nullptr, nullptr, nullptr, "Markdown");
+    });
+
     bot.getEvents().onAnyMessage([&bot, &storage](Message::Ptr message) {
         upsert_user(storage, message->from);
         if (is_admin(message->from)) { // Admins can bypass some checks
@@ -243,7 +254,48 @@ int main() {
             keyboard->inlineKeyboard.push_back(row);
             bot.getApi().sendMessage(message->chat->id, "Qaysi formatda yuklab olmoqchisiz?", nullptr, nullptr, keyboard);
         } else {
-            bot.getApi().sendMessage(message->chat->id, "Iltimos, yaroqli YouTube havolasini yuboring.");
+            // It's not a link, so treat it as a search query for audio.
+            thread([&bot, &storage, message]() {
+                Message::Ptr status_message = bot.getApi().sendMessage(message->chat->id, "⏳ Qidirilmoqda: " + message->text);
+                try {
+                    const string download_dir = "downloads";
+                    fs::create_directory(download_dir);
+                    fs::permissions(download_dir, fs::perms::all);
+                    for(const auto& file : fs::directory_iterator(download_dir)) fs::remove_all(file.path());
+
+                    string query = message->text;
+                    // Sanitize query to prevent command injection
+                    std::string::size_type pos = query.find_first_of(";'\"`|&");
+                    if (pos != std::string::npos) {
+                        query = query.substr(0, pos);
+                    }
+
+                    string command = "yt-dlp -o 'downloads/%(title)s.%(ext)s' -x --audio-format mp3 \"ytsearch1:" + query + "\"";
+
+                    int exit_code;
+                    string exec_output = exec(command.c_str(), exit_code);
+
+                    if (exit_code != 0) {
+                        bot.getApi().editMessageText("Xatolik: Qo'shiq topilmadi yoki yuklab bo'lmadi.", status_message->chat->id, status_message->messageId);
+                        printf("yt-dlp search error output:\n%s\n", exec_output.c_str());
+                        return;
+                    }
+
+                    string file_path = find_first_file(download_dir);
+
+                    if (!file_path.empty()) {
+                        bot.getApi().editMessageText("🎧 Audio yuborilmoqda...", status_message->chat->id, status_message->messageId);
+                        bot.getApi().sendAudio(message->chat->id, InputFile::fromFile(file_path, "audio/mpeg"));
+                        bot.getApi().deleteMessage(status_message->chat->id, status_message->messageId);
+                        increment_stat(storage, "downloads_count");
+                        fs::remove(file_path);
+                    } else {
+                        bot.getApi().editMessageText("Xatolik: Yuklab olingan faylni topa olmadim.", status_message->chat->id, status_message->messageId);
+                    }
+                } catch (const exception& e) {
+                    bot.getApi().editMessageText("Umumiy xatolik: " + string(e.what()), status_message->chat->id, status_message->messageId);
+                }
+            }).detach();
         }
     });
 

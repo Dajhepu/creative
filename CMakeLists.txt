@@ -11,7 +11,6 @@ find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
 
-# Add sqlite_orm library from the vendor directory
 include_directories(vendor/sqlite_orm/include)
 
 add_executable(TgYoutubeBot main.cpp)

@@ -54,6 +54,7 @@ RUN apt-get update && apt-get install -y \
     libsqlite3-0 \
     python3-pip \
     python-is-python3 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install yt-dlp
