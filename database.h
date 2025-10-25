@@ -5,7 +5,6 @@
 
 namespace db {
 
-// Represents a user in the database
 struct User {
     int64_t id;
     std::string first_name;
@@ -14,22 +13,16 @@ struct User {
     std::string created_at;
 };
 
-// Represents a key-value setting in the database
 struct Setting {
     std::string key;
     std::string value;
 };
 
-// Represents a statistic counter in the database
 struct Stat {
     std::string key;
     int64_t value;
 };
 
-
-// Creates and returns a storage (database connection) object.
-// The database file is named "bot_database.sqlite".
-// This function also syncs the schema, creating tables if they don't exist.
 inline auto init_storage(const std::string& path) {
     using namespace sqlite_orm;
     return make_storage(path,
